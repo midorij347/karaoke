@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- CDC-ACM (Communication class = 2) をクラス指定で拾う -->
+    <usb-device class="2" subclass="2" protocol="1" />
+    <!-- データインターフェース(クラス10=CDC Data)は親で拾えるので省略可 -->
+</resources>
