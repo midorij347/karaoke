@@ -5,103 +5,93 @@ import java.util.concurrent.ArrayBlockingQueue
 import kotlin.math.*
 
 object AudioPipe {
-    // 16kHz / 16-bit / Mono 前提
+    // ★ 実機のサンプリング周波数に合わせる（16k/24k/32k/44.1k など）
     private const val SR = 16000
+
+    // メル生成パラメータ（そのままでOK）
     private const val FFT_SIZE = 512
-    private const val HOP = 160       // 10ms
-    private const val WIN = 400       // 25ms
+    private const val HOP = 160       // 10ms @16k
+    private const val WIN = 400       // 25ms @16k
     private const val MEL_BANDS = 64
     private const val F_MIN = 20.0
     private const val F_MAX = 8000.0
 
-    // Ring-like queue for PCM shorts
+    // 入力PCMキュー
     private val q = ArrayBlockingQueue<ShortArray>(32)
 
-    // Window
-    private val win = FloatArray(WIN) { i -> (0.5f * (1f - cos(2.0 * Math.PI * i / (WIN - 1))).toFloat()) }
+    // 窓（Hann）
+    private val win = FloatArray(WIN) { i ->
+        (0.5f * (1f - cos(2.0 * Math.PI * i / (WIN - 1))).toFloat())
+    }
 
-    // FFT helper
+    // FFT/Mel
     private val fft = FFT(FFT_SIZE)
-
-    // Mel filterbank
     private val mel = MelFilterbank(SR, FFT_SIZE, MEL_BANDS, F_MIN, F_MAX)
 
-    // Overlap buffer
+    // オーバーラップ用バッファ
     private val frameBuf = FloatArray(WIN)
     private var framePos = 0
 
-    // Consumer scope
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    // FFTピークロギング用（Logcat確認）
+    private val analyzer = FftAnalyzer(sampleRate = SR, fftSize = 1024, logTag = "FFT")
 
-    // Callback: push one mel column (size=MEL_BANDS, dB)
+    // 出力コールバック（メル列）
     interface MelSink { fun onMelColumn(columnDb: FloatArray) }
     @Volatile private var sink: MelSink? = null
     fun setSink(s: MelSink) { sink = s }
 
     fun enqueuePcm(s: ShortArray) {
+        android.util.Log.i("FFT","feed n=${s.size}")
+        analyzer.feedPcm16Le(s)
         q.offer(s)
     }
 
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
     init {
         scope.launch {
-            val tmpPcm = FloatArray(2048)
             val fftIn = FloatArray(FFT_SIZE)
             val fftOutRe = FloatArray(FFT_SIZE)
             val fftOutIm = FloatArray(FFT_SIZE)
 
             while (isActive) {
                 val chunk = q.take() // blocking
-                // short→float(-1..1)
-                val n = chunk.size
-                for (i in 0 until n) tmpPcm[i] = chunk[i] / 32768f
-
                 var idx = 0
+                val n = chunk.size
+
                 while (idx < n) {
-                    // overlap-add バッファへ詰める
                     val canCopy = min(n - idx, WIN - framePos)
-                    tmpPcm.copyInto(frameBuf, framePos, idx, idx + canCopy)
+                    var i = 0
+                    while (i < canCopy) {
+                        frameBuf[framePos + i] = chunk[idx + i] / 32768f
+                        i++
+                    }
                     framePos += canCopy
                     idx += canCopy
 
                     if (framePos == WIN) {
-                        // 窓
-                        for (i in 0 until WIN) {
-                            fftIn[i] = frameBuf[i] * win[i]
-                        }
-                        // ゼロパディング
-                        for (i in WIN until FFT_SIZE) fftIn[i] = 0f
-
-                        // FFT
+                        for (i2 in 0 until WIN) fftIn[i2] = frameBuf[i2] * win[i2]
+                        for (i2 in WIN until FFT_SIZE) fftIn[i2] = 0f
                         System.arraycopy(fftIn, 0, fftOutRe, 0, FFT_SIZE)
                         java.util.Arrays.fill(fftOutIm, 0f)
                         fft.fft(fftOutRe, fftOutIm)
-
-                        // パワースペクトル（正規化簡略）
-                        val mag2 = FloatArray(FFT_SIZE/2 + 1)
-                        for (k in 0..FFT_SIZE/2) {
+                        val mag2 = FloatArray(FFT_SIZE / 2 + 1)
+                        for (k in 0..FFT_SIZE / 2) {
                             val re = fftOutRe[k]; val im = fftOutIm[k]
-                            mag2[k] = re*re + im*im
+                            mag2[k] = re * re + im * im
                         }
-
-                        // Melフィルタ→エネルギー
                         val melE = mel.apply(mag2)
-
-                        // dB（安全なlog）
                         val col = FloatArray(MEL_BANDS)
                         for (m in 0 until MEL_BANDS) {
                             val e = max(1e-12f, melE[m])
-                            col[m] = (10f * ln(e) / ln(10f)) // ln→dB
+                            col[m] = (10f * ln(e) / ln(10f))
                         }
                         sink?.onMelColumn(col)
 
-                        // hop分スライド
                         if (HOP < WIN) {
-                            // 左に詰める
                             System.arraycopy(frameBuf, HOP, frameBuf, 0, WIN - HOP)
                             framePos = WIN - HOP
-                        } else {
-                            framePos = 0
-                        }
+                        } else framePos = 0
                     }
                 }
             }
@@ -109,21 +99,23 @@ object AudioPipe {
     }
 }
 
-/** Simple radix-2 FFT (in-place) */
 class FFT(private val n: Int) {
     private val levels = Integer.numberOfTrailingZeros(n)
-    private val cos = FloatArray(n / 2)
-    private val sin = FloatArray(n / 2)
+    // 名前衝突を避けるため cos/sin → cosTable/sinTable
+    private val cosTable = FloatArray(n / 2)
+    private val sinTable = FloatArray(n / 2)
+
     init {
         require(1 shl levels == n) { "FFT size must be power of 2" }
-        for (i in 0 until n/2) {
+        for (i in 0 until n / 2) {
             val ang = -2.0 * Math.PI * i / n
-            cos[i] = cos(ang).toFloat()
-            sin[i] = sin(ang).toFloat()
+            // ★ kotlin.math.cos/sin を明示
+            cosTable[i] = kotlin.math.cos(ang).toFloat()
+            sinTable[i] = kotlin.math.sin(ang).toFloat()
         }
     }
+
     fun fft(re: FloatArray, im: FloatArray) {
-        // bit-reverse
         var j = 0
         for (i in 1 until n - 1) {
             var bit = n shr 1
@@ -144,8 +136,11 @@ class FFT(private val n: Int) {
                 var j2 = i
                 while (k < half) {
                     val l = j2 + half
-                    val tpr = re[l] * cos[k * tableStep] - im[l] * sin[k * tableStep]
-                    val tpi = re[l] * sin[k * tableStep] + im[l] * cos[k * tableStep]
+                    // ★ 参照先を cosTable/sinTable に統一
+                    val ct = cosTable[k * tableStep]
+                    val st = sinTable[k * tableStep]
+                    val tpr = re[l] * ct - im[l] * st
+                    val tpi = re[l] * st + im[l] * ct
                     re[l] = re[j2] - tpr
                     im[l] = im[j2] - tpi
                     re[j2] += tpr
@@ -159,7 +154,6 @@ class FFT(private val n: Int) {
     }
 }
 
-/** Mel filterbank (triangular filters on linear FFT bins) */
 class MelFilterbank(
     sr: Int,
     fftSize: Int,
@@ -179,11 +173,15 @@ class MelFilterbank(
         val melMax = hz2mel(fMax)
         val melPoints = DoubleArray(m + 2) { melMin + (melMax - melMin) * it / (m + 1) }
         val hzPoints = DoubleArray(m + 2) { mel2hz(melPoints[it]) }
-        val bin = IntArray(m + 2) { ((nFft) * hzPoints[it] / sr).roundToInt().coerceIn(0, nSpec - 1) }
+        val bin = IntArray(m + 2) {
+            ((nFft) * hzPoints[it] / sr).roundToInt().coerceIn(0, nSpec - 1)
+        }
 
         filters = Array(m) { FloatArray(nSpec) }
         for (i in 0 until m) {
-            val start = bin[i]; val center = bin[i + 1]; val end = bin[i + 2]
+            val start = bin[i]
+            val center = bin[i + 1]
+            val end = bin[i + 2]
             if (center == start || end == center) continue
             for (k in start until center) {
                 filters[i][k] = ((k - start).toFloat() / (center - start))

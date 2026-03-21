@@ -6,13 +6,14 @@ import android.content.Context
 import android.content.Intent
 import android.hardware.usb.*
 import android.os.IBinder
+import android.util.Log
 import kotlinx.coroutines.*
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 class UsbReaderService : Service() {
     companion object {
-        private const val ACTION_START = "com.example.melscope.ACTION_START"
+        private const val ACTION_START = "com.example.karaoke.ACTION_START"
         private const val EXTRA_DEVICE = "device"
 
         fun start(ctx: Context, device: UsbDevice) {
@@ -65,13 +66,14 @@ class UsbReaderService : Service() {
         inEp = epIn
 
         // CDCライン設定(ボーレート等)は必要ない（ESP側はUSB-CDCでRaw垂れ流し）
-        // 読み取りループ
         epIn ?: return
         scope.launch {
             val buf = ByteArray(4096)
             val bb = ByteBuffer.allocate(4096).order(ByteOrder.LITTLE_ENDIAN)
             while (isActive) {
-                val read = connection.bulkTransfer(epIn, buf, buf.size, 50) // 50ms timeout
+                val read = connection.bulkTransfer(epIn, buf, buf.size, 50) ?: -1
+
+
                 if (read != null && read > 0) {
                     // 受信バイト列→Short PCM へ詰め替え
                     // ESPは16-bit little-endian モノラル
@@ -82,7 +84,6 @@ class UsbReaderService : Service() {
                     bb.asShortBuffer().get(shorts)
                     AudioPipe.enqueuePcm(shorts) // DSP側へ投入
                 }
-                // else: タイムアウトはループ継続
             }
         }
     }

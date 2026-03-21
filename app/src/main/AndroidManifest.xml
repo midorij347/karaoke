@@ -15,9 +15,12 @@
         <receiver android:name=".UsbPermissionReceiver"
             android:exported="false">
             <intent-filter>
-                <action android:name="com.example.melscope.USB_PERMISSION"/>
+                <action android:name="com.example.karaoke.USB_PERMISSION"/>
             </intent-filter>
         </receiver>
+        <service
+            android:name=".UsbReaderService"
+            android:exported="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true"
